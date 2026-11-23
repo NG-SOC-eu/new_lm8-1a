@@ -1,0 +1,59 @@
+---
+phishing_simulator_compose_dir: /opt/phishing-simulator
+dockerhub_username: ""
+dockerhub_password: ""
+phishing_simulator_docker_image: gophish/gophish:latest
+phishing_simulator_admin_port: 3333
+phishing_simulator_phishing_port: 80
+phishing_simulator_smtp_host: 10.20.10.60
+phishing_simulator_smtp_port: 1025
+# Phishing sender. Its TLD (.net) is the answer to training L13, and it MUST
+# differ from the TLD of the corporate staff directory served at
+# lms.internal:8080/module2/ (company-corp.com) so L20 stays MISMATCH. Keep the
+# lms-content var lms_content_phishing_from_address in sync if you change this.
+phishing_simulator_from_address: "security@company-corp.net"
+phishing_simulator_healthcheck:
+  port: "{{ phishing_simulator_admin_port }}"
+  timeout: 120
+  delay: 5
+
+# Recrea el volumen gophish-data en cada deploy para partir de una BD limpia y
+# escribible (modelo auto-launch, cada deploy = instancia nueva). Ponlo en false
+# si quieres persistir el estado de GoPhish entre despliegues.
+phishing_simulator_reset_gophish_on_deploy: true
+
+# --- LAUNCH_CAMPAIGN (Gate 1) automation -----------------------------------
+# Recipient roster used by launch_campaign.py to build the GoPhish target group.
+# These are lab addresses: with the MailHog Lab Relay sending profile every
+# message is captured by Mailpit (mail-relay.internal:8025), nothing leaves the
+# range. Override per cohort via group_vars or -e phishing_simulator_trainees=...
+# The email greets each recipient by GoPhish's FirstName field and L22 counts the
+# greeting as personalised, so first names must read as names: with "Trainee"
+# the greeting became "Dear Trainee," and looked like the generic red flag.
+# The addresses are the ones L2 and L12 name per workstation; keep them.
+phishing_simulator_trainees:
+  - {first_name: "Alex", last_name: "Morgan", email: "trainee01@cynet.lab", position: "Staff"}
+  - {first_name: "Sam", last_name: "Taylor", email: "trainee02@cynet.lab", position: "Staff"}
+
+# Auto-launch the phishing campaign at deploy time (Gate 1). When true, the
+# provisioning playbook runs launch_campaign.py on phishing-simulator so the
+# instructor no longer needs the LAUNCH_CAMPAIGN alias. Set to false to fall
+# back to the fully manual flow (the alias still works either way). The launcher
+# is guarded against double-sends, so redeploys never fire a second email.
+phishing_simulator_auto_launch: true
+
+# Names of the GoPhish objects launch_campaign.py reuses/creates (overridable).
+# Template / page / group are reused by name (idempotent). The campaign is
+# created once under this stable name; the launcher's guard skips the launch if
+# a campaign with this name already exists, so re-runs never send a second email.
+phishing_simulator_campaign_name: "Security Compliance Drill"
+phishing_simulator_template_name: "IT Security Compliance Notice"
+phishing_simulator_page_name: "Compliance Verification Landing"
+phishing_simulator_group_name: "Cohort Trainees"
+# Existing sending profile pre-configured by this role (do not rename here).
+phishing_simulator_smtp_profile_name: "MailHog Lab Relay"
+# Subject line for the phishing email template (configurable; the template HTML
+# body itself is a training answer and is NEVER modified by the launcher).
+phishing_simulator_email_subject: "URGENT: IT Security Compliance Action Required"
+# Landing URL the phishing link points at (GoPhish serves the page on port 80).
+phishing_simulator_campaign_url: "http://phishing-simulator.internal"

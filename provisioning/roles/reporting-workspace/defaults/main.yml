@@ -1,0 +1,72 @@
+---
+reporting_workspace_grafana_package: grafana
+reporting_workspace_grafana_ini: /etc/grafana/grafana.ini
+reporting_workspace_grafana_admin_user: admin
+# Lab-only hardcoded value. Disposable CyberRangeCZ sandbox only — do NOT reuse in real environments.
+reporting_workspace_grafana_admin_password: "admin"
+
+# UML Step 8 is Platform -> Instructor, but training levels L26/L27 have the
+# trainee read the same cohort dashboard. Anonymous Viewer access gives them that
+# read-only, so the shared admin login never has to be handed out in the training
+# definition — a Viewer cannot edit, save or delete a panel. The login form stays
+# enabled, so the instructor still signs in as admin for anything else.
+# Set to false to require a login for everyone; L26/L27 then need credentials again.
+reporting_workspace_grafana_anonymous_viewer: true
+reporting_workspace_grafana_anonymous_org_name: "Main Org."
+reporting_workspace_grafana_anonymous_org_role: Viewer
+reporting_workspace_datasource_template: /etc/grafana/provisioning/datasources/rep.yaml
+reporting_workspace_dashboards_dir: /etc/grafana/provisioning/dashboards
+reporting_workspace_datasources:
+  - name: rep_postgresql
+    type: postgres
+    url: localhost:5432
+    database: rep_reporting
+    user: rep_reporting
+    # PostgreSQL runs on the same host without TLS; Grafana's postgres plugin
+    # defaults to sslmode=require and would refuse the connection.
+    sslmode: disable
+    secureJsonData:
+      password: changeme
+reporting_workspace_dashboards:
+  - uid: rep-overview
+    title: REP Overview
+    folder: REP
+    file: rep-overview.json
+reporting_workspace_healthcheck:
+  url: http://127.0.0.1:3000/api/health
+  status_code: 200
+  status_code_alternatives: []
+  failed_when_non_json: Grafana health endpoint did not return JSON. Check Grafana service status.
+reporting_workspace_grafana_service: grafana-server
+reporting_workspace_scoring_dir: /opt/rep-scoring
+
+# --- Gate 2: periodic auto-finalize (score -> deliver -> publish) -----------
+# When true, install a systemd timer that unattended runs rep_finalize.sh every
+# few minutes, replacing the manual FINALIZE_FEEDBACK alias. Set to false to
+# return to the fully manual flow (the alias still works either way). Toggling
+# this also gates the SSH key generated for publishing to the LMS.
+reporting_workspace_auto_finalize: true
+# Local OS user that runs the timer AND owns the feedback pages in
+# /tmp/rep-feedback. Kept equal to the deploy user (ubuntu) so it matches what
+# the manual deliver_feedback/publish_feedback flow uses (no ownership clashes).
+reporting_workspace_publish_user: "{{ ansible_user | default('ubuntu') }}"
+# LMS publish target. reporting-workspace SCPs the feedback *.html here as
+# {{ reporting_workspace_lms_ssh_user }}@{{ reporting_workspace_lms_host }},
+# exactly like the manual publish_feedback path.
+reporting_workspace_lms_host: lms.internal
+reporting_workspace_lms_feedback_dir: /srv/lms/feedback
+reporting_workspace_lms_ssh_user: "{{ hostvars['rep-practical-labs']['ansible_user'] | default('ubuntu') }}"
+reporting_workspace_gophish_host: "http://phishing-simulator.internal:3333"
+reporting_workspace_feedback_output_dir: /tmp/rep-feedback
+reporting_workspace_grafana_repositories:
+  - name: grafana_oss
+    apt_key:
+      url: https://apt.grafana.com/gpg.key
+      keyring: /usr/share/keyrings/grafana.gpg
+      state: present
+    apt_repository:
+      repo: >-
+        deb [signed-by=/usr/share/keyrings/grafana.gpg] https://apt.grafana.com stable main
+      filename: grafana
+      state: present
+      update_cache: true

@@ -1,0 +1,69 @@
+---
+instructor_console_user: instructor
+instructor_console_workspace: /opt/instructor-console
+instructor_console_lms_content_dir: /opt/instructor-console/lms-content
+instructor_console_lms_course_title: "Phishing Attack Awareness - PUC2-Sub Case 2a"
+instructor_console_lms_deploy_user: "{{ hostvars['rep-practical-labs']['ansible_user'] | default('ubuntu') }}"
+instructor_console_tmux_conf: /home/{{ instructor_console_user }}/.tmux.conf
+instructor_console_aliases: /etc/profile.d/instructor-console.sh
+instructor_console_shortcuts:
+  - name: open_gophish_admin
+    command: "firefox http://phishing-simulator.internal:3333/"
+  - name: open_lms_portal
+    command: "firefox http://lms.internal:8080/"
+  - name: open_mailpit
+    command: "firefox http://mail-relay.internal:8025/"
+  - name: open_grafana
+    command: "firefox http://reporting.internal:3000/"
+  # The credentials file and the GoPhish API key live on phishing-simulator and
+  # reporting-workspace as root-only (0600) files, so these read them over SSH
+  # with sudo rather than from the console's own disk.
+  - name: show_gophish_credentials
+    command: "ssh -t phishing-simulator \"sudo cat /opt/phishing-simulator/admin_credentials.txt\""
+  - name: score_campaign
+    command: "ssh -t reporting-workspace \"sudo bash -c 'set -a; . /opt/rep-scoring/gophish.env; python3 /opt/rep-scoring/score_campaign.py $@'\""
+  - name: deliver_feedback
+    command: "ssh -t reporting-workspace \"python3 /opt/rep-scoring/deliver_feedback.py $@\""
+  - name: publish_feedback
+    command: "ssh lms.internal 'mkdir -p /srv/lms/feedback' && scp -3 -o StrictHostKeyChecking=no reporting-workspace:/tmp/rep-feedback/*.html lms.internal:/srv/lms/feedback/ && echo '[+] Feedback pages published to http://lms.internal:8080/feedback/'"
+  # Gate 1 one-shot: build/reuse template+page+group, then create & launch the
+  # campaign on phishing-simulator. Prints the resulting CAMPAIGN ID.
+  - name: launch_campaign
+    command: "ssh -t phishing-simulator \"sudo python3 /opt/phishing-simulator/launch_campaign.py $@\""
+  # Gate 2 one-shot: score -> deliver -> publish, resolving the campaign id
+  # automatically when omitted. Reuses the score/deliver/publish commands above.
+  - name: finalize_feedback
+    command: "/opt/instructor-console/finalize_feedback.sh $@"
+  - name: publish_lms
+    command: "python3 /opt/instructor-console/lms_publish.py && scp -i /home/{{ instructor_console_user }}/.ssh/id_ed25519 -o StrictHostKeyChecking=no /tmp/lms-build/index.html {{ instructor_console_lms_deploy_user }}@lms.internal:/srv/lms/index.html && echo '[+] LMS updated at http://lms.internal:8080/'"
+# Hosts the shortcuts and tmux windows SSH into. /etc/hosts on the lab only
+# carries the *.internal service names, so the short names the shortcuts use
+# (`ssh phishing-simulator`, ...) are mapped to them in the instructor's
+# ~/.ssh/config, and the instructor key is authorized for the inventory
+# account of each host. `alias` is the short name, `hostname` what it resolves
+# to, `inventory_host` the inventory entry that owns the account.
+instructor_console_ssh_targets:
+  - alias: phishing-simulator
+    hostname: phishing-simulator.internal
+    inventory_host: phishing-simulator
+  - alias: reporting-workspace
+    hostname: reporting.internal
+    inventory_host: reporting-workspace
+  - alias: mail-relay
+    hostname: mail-relay.internal
+    inventory_host: mail-relay
+  - alias: rep-practical-labs
+    hostname: lms.internal
+    inventory_host: rep-practical-labs
+instructor_console_tmux_settings:
+  mouse_mode: true
+  history_limit: 10000
+  status_bar_colour: '#268bd2'
+  windows:
+    - name: gophish
+      command: "ssh phishing-simulator"
+    - name: mail-relay
+      command: "ssh mail-relay"
+    - name: monitoring
+      command: "ssh reporting-workspace"
+instructor_console_healthcheck_command: "tmux list-sessions"

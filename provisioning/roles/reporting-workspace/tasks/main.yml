@@ -1,0 +1,357 @@
+- name: Install and initialise PostgreSQL for REP reporting data
+  ansible.builtin.include_tasks: install_postgresql.yml
+
+- name: Install Python psycopg2 for scoring engine
+  ansible.builtin.package:
+    name: python3-psycopg2
+    state: present
+
+- name: Ensure scoring engine directory exists
+  ansible.builtin.file:
+    path: "{{ reporting_workspace_scoring_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Deploy scoring engine script
+  ansible.builtin.copy:
+    src: score_campaign.py
+    dest: "{{ reporting_workspace_scoring_dir }}/score_campaign.py"
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Deploy feedback delivery script
+  ansible.builtin.copy:
+    src: deliver_feedback.py
+    dest: "{{ reporting_workspace_scoring_dir }}/deliver_feedback.py"
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Configure Grafana repositories
+  when: reporting_workspace_grafana_repositories | length > 0
+  ansible.builtin.include_tasks: configure_grafana_repository.yml
+  loop: "{{ reporting_workspace_grafana_repositories }}"
+  loop_control:
+    loop_var: grafana_repository
+    label: "{{ grafana_repository.name | default(grafana_repository.apt_repository.repo | default('grafana repository')) }}"
+
+- name: Install Grafana package
+  ansible.builtin.package:
+    name: "{{ reporting_workspace_grafana_package }}"
+    state: present
+
+- name: Ensure Grafana service is enabled and started
+  ansible.builtin.service:
+    name: "{{ reporting_workspace_grafana_service }}"
+    enabled: true
+    state: started
+  notify: restart grafana
+
+- name: Ensure grafana group exists
+  ansible.builtin.group:
+    name: grafana
+    system: true
+
+- name: Ensure grafana user exists
+  ansible.builtin.user:
+    name: grafana
+    group: grafana
+    system: true
+
+- name: Ensure Grafana provisioning directories exist
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: grafana
+    mode: "0750"
+  loop:
+    - "{{ reporting_workspace_datasource_template | dirname }}"
+    - "{{ reporting_workspace_dashboards_dir }}"
+
+- name: Deploy Grafana main configuration
+  ansible.builtin.template:
+    src: grafana.ini.j2
+    dest: "{{ reporting_workspace_grafana_ini }}"
+    owner: root
+    group: grafana
+    mode: "0640"
+  notify: restart grafana
+
+- name: Configure Grafana data sources for REP
+  ansible.builtin.template:
+    src: datasources.yaml.j2
+    dest: "{{ reporting_workspace_datasource_template }}"
+    owner: root
+    group: grafana
+    mode: "0640"
+  notify: restart grafana
+  no_log: true
+
+- name: Register Grafana dashboard providers
+  ansible.builtin.template:
+    src: dashboards.yaml.j2
+    dest: "{{ reporting_workspace_dashboards_dir }}/rep-provider.yaml"
+    owner: root
+    group: grafana
+    mode: "0640"
+  notify: restart grafana
+
+- name: Ensure dashboard folders exist
+  ansible.builtin.file:
+    path: "{{ reporting_workspace_dashboards_dir }}/{{ dashboard.folder | lower }}"
+    state: directory
+    owner: root
+    group: grafana
+    mode: "0750"
+  loop: "{{ reporting_workspace_dashboards | list }}"
+  loop_control:
+    loop_var: dashboard
+
+- name: Deploy REP dashboards
+  ansible.builtin.template:
+    src: dashboard.json.j2
+    dest: "{{ reporting_workspace_dashboards_dir }}/{{ dashboard.folder | lower }}/{{ dashboard.file }}"
+    owner: root
+    group: grafana
+    mode: "0640"
+  loop: "{{ reporting_workspace_dashboards | list }}"
+  loop_control:
+    loop_var: dashboard
+  notify: restart grafana
+
+- name: Apply pending Grafana restarts and validate service
+  block:
+    - name: Apply pending Grafana restarts before health checks
+      ansible.builtin.meta: flush_handlers
+
+    - name: Ensure Grafana service is enabled and started after provisioning
+      ansible.builtin.service:
+        name: "{{ reporting_workspace_grafana_service }}"
+        enabled: true
+        state: started
+
+  rescue:
+    - name: Read Grafana service status
+      ansible.builtin.command:
+        cmd: systemctl status {{ reporting_workspace_grafana_service }} --no-pager
+      register: grafana_status
+      changed_when: false
+      failed_when: false
+
+    - name: Read Grafana journal
+      ansible.builtin.command:
+        cmd: journalctl -u {{ reporting_workspace_grafana_service }} -n 100 --no-pager
+      register: grafana_journal
+      changed_when: false
+      failed_when: false
+
+    - name: Fail with Grafana diagnostics
+      ansible.builtin.fail:
+        msg: |-
+          Unable to start or restart Grafana.
+
+          systemctl status:
+          {{ grafana_status.stdout | default('') }}
+
+          journalctl:
+          {{ grafana_journal.stdout | default('') }}
+
+- name: Wait for Grafana service port to become available
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: 3000
+    timeout: 30
+    sleep: 1
+  when:
+    - reporting_workspace_healthcheck is defined
+    - reporting_workspace_healthcheck.url | length > 0
+
+- name: Validate Grafana is responding
+  ansible.builtin.uri:
+    url: "{{ reporting_workspace_healthcheck.url }}"
+    method: GET
+    status_code: >-
+      {{
+        [reporting_workspace_healthcheck.status_code | int]
+        + (
+          reporting_workspace_healthcheck.status_code_alternatives | default([])
+          | map('int')
+          | list
+        )
+      }}
+    return_content: true
+    headers:
+      Accept: application/json
+  register: reporting_workspace_health
+  failed_when:
+    - >-
+      reporting_workspace_health.json is not defined
+      and (
+        reporting_workspace_healthcheck.failed_when_non_json
+        | default(
+          'Grafana health endpoint %s did not return JSON. Status: %s, Body: %s'
+          % (
+            reporting_workspace_healthcheck.url,
+            reporting_workspace_health.status | default('unknown'),
+            reporting_workspace_health.content | default('') | truncate(200, True, '...')
+          ),
+          true
+        )
+        | bool
+      )
+    - >-
+      reporting_workspace_health.json is defined
+      and (reporting_workspace_health.json.database | default('')) != 'ok'
+  changed_when: false
+  when:
+    - reporting_workspace_healthcheck is defined
+    - reporting_workspace_healthcheck.url | length > 0
+
+- name: Set Grafana admin password for lab access
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:3000/api/admin/users/1/password"
+    method: PUT
+    url_username: "{{ reporting_workspace_grafana_admin_user }}"
+    url_password: "{{ reporting_workspace_grafana_admin_password }}"
+    force_basic_auth: true
+    body_format: json
+    body:
+      password: "{{ reporting_workspace_grafana_admin_password }}"
+    status_code: [200]
+  no_log: true
+
+# --- Read-only cohort dashboard for trainees (L26/L27) ----------------------
+# Fail loudly if anonymous Viewer access did not actually take effect: L26/L27
+# tell trainees to open the dashboard without credentials, so a silent
+# regression here leaves both levels unsolvable. Retried because Grafana's file
+# provisioner needs a moment to register the dashboard after a restart.
+- name: Fetch the REP dashboard without credentials
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:3000/api/dashboards/uid/{{ reporting_workspace_dashboards[0].uid }}"
+    method: GET
+    status_code: [200, 401, 403, 404]
+  register: reporting_workspace_anonymous_check
+  changed_when: false
+  retries: 5
+  delay: 3
+  until: reporting_workspace_anonymous_check.status == 200
+  failed_when: false
+  when: reporting_workspace_grafana_anonymous_viewer | bool
+
+- name: Assert trainees can read the cohort dashboard without logging in
+  ansible.builtin.assert:
+    that:
+      - reporting_workspace_anonymous_check.status == 200
+      - >-
+        (reporting_workspace_anonymous_check.json.dashboard.title | default(''))
+        == reporting_workspace_dashboards[0].title
+    fail_msg: >-
+      An unauthenticated request for the '{{ reporting_workspace_dashboards[0].title }}'
+      dashboard returned {{ reporting_workspace_anonymous_check.status | default('no response') }}.
+      Training levels L26/L27 ask trainees to open Grafana with no credentials, so
+      both would be unsolvable. Check [auth.anonymous] in grafana.ini and that the
+      anonymous org ({{ reporting_workspace_grafana_anonymous_org_name }}) owns the
+      provisioned dashboard.
+    success_msg: >-
+      Cohort dashboard is readable anonymously with the
+      {{ reporting_workspace_grafana_anonymous_org_role }} role; L26/L27 are solvable
+      without handing out the admin login.
+  when: reporting_workspace_grafana_anonymous_viewer | bool
+
+# --- Gate 2: periodic auto-finalize (score -> deliver -> publish) -----------
+# Installs rep_finalize.sh plus a systemd timer that runs it unattended, so the
+# instructor no longer needs the FINALIZE_FEEDBACK alias. Everything below is
+# gated by reporting_workspace_auto_finalize; when false the manual flow is
+# untouched. The SSH key generated here is authorised on the LMS by the play
+# "Authorize reporting-workspace SSH key on LMS ..." in provisioning/playbook.yml.
+
+- name: Generate SSH key for the publish user (passwordless SCP to the LMS)
+  ansible.builtin.user:
+    name: "{{ reporting_workspace_publish_user }}"
+    generate_ssh_key: true
+    ssh_key_type: ed25519
+    ssh_key_comment: "reporting-workspace@cyberrange-lm8-2a"
+  when: reporting_workspace_auto_finalize | bool
+
+- name: Deploy Gate 2 auto-finalize script
+  ansible.builtin.copy:
+    src: rep_finalize.sh
+    dest: "{{ reporting_workspace_scoring_dir }}/rep_finalize.sh"
+    owner: root
+    group: root
+    mode: "0755"
+  when: reporting_workspace_auto_finalize | bool
+
+- name: Deploy Gate 2 auto-finalize systemd service unit
+  ansible.builtin.template:
+    src: rep-finalize.service.j2
+    dest: /etc/systemd/system/rep-finalize.service
+    owner: root
+    group: root
+    mode: "0644"
+  register: reporting_workspace_finalize_service
+  when: reporting_workspace_auto_finalize | bool
+
+- name: Deploy Gate 2 auto-finalize systemd timer unit
+  ansible.builtin.template:
+    src: rep-finalize.timer.j2
+    dest: /etc/systemd/system/rep-finalize.timer
+    owner: root
+    group: root
+    mode: "0644"
+  register: reporting_workspace_finalize_timer
+  when: reporting_workspace_auto_finalize | bool
+
+- name: Reload systemd so the auto-finalize units are picked up
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when:
+    - reporting_workspace_auto_finalize | bool
+    - reporting_workspace_finalize_service is changed
+      or reporting_workspace_finalize_timer is changed
+
+- name: Enable and start the Gate 2 auto-finalize timer
+  ansible.builtin.systemd:
+    name: rep-finalize.timer
+    enabled: true
+    # 'restarted' (not 'started') re-arms the timer deterministically: it forces
+    # systemd to recompute NextElapse regardless of any stale pre-change state
+    # the module may have read. Cheap for a .timer, and it removes the
+    # non-determinism where the deploy went green but the timer stayed dead.
+    state: restarted
+  when: reporting_workspace_auto_finalize | bool
+
+# Fail loudly if the timer did not actually arm. Without this the deploy could
+# go green while rep-finalize.timer is inactive/dead, so Gate 2 auto-finalize would
+# never run and trainee feedback (L24/L25) would never be produced.
+- name: Query the Gate 2 timer arming state
+  ansible.builtin.command:
+    cmd: systemctl show rep-finalize.timer --property=ActiveState --property=NextElapseUSecRealtime --value
+  register: rep_finalize_timer_state
+  changed_when: false
+  retries: 5
+  delay: 3
+  until: >-
+    ('active' in rep_finalize_timer_state.stdout_lines | default([]))
+    and (rep_finalize_timer_state.stdout_lines | default([]) | length >= 2)
+    and (rep_finalize_timer_state.stdout_lines[1] | trim not in ['', 'n/a', '0', 'infinity'])
+  when: reporting_workspace_auto_finalize | bool
+
+- name: Assert the Gate 2 timer is active and armed (has a real next run)
+  ansible.builtin.assert:
+    that:
+      - "'active' in rep_finalize_timer_state.stdout_lines | default([])"
+      - rep_finalize_timer_state.stdout_lines | default([]) | length >= 2
+      - rep_finalize_timer_state.stdout_lines[1] | trim not in ['', 'n/a', '0', 'infinity']
+    fail_msg: >-
+      rep-finalize.timer is NOT armed (ActiveState/NextElapse:
+      {{ rep_finalize_timer_state.stdout | default('n/a') }}). Gate 2 auto-finalize
+      would never run, so trainee feedback (L24/L25) would never be produced. Check the
+      unit install, daemon-reload, and that systemd is the running init on this host.
+    success_msg: >-
+      rep-finalize.timer is active and armed; Gate 2 auto-finalize will run on schedule.
+  when: reporting_workspace_auto_finalize | bool
