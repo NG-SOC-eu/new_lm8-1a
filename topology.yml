@@ -1,4 +1,4 @@
-name: lm8-subcase-2a-phishing-training
+name: lm8-1a-puc2-subcase-2a-phishing-training
 hosts:
   - name: instructor-console
     base_box:
